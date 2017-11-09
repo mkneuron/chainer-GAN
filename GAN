@@ -2,42 +2,53 @@ import numpy as np
 import math as m
 from chainer import functions as F
 from chainer import links as L
-from chainer import Chain, Variable, optimizers, iterators, config
+from chainer import Chain, Variable, optimizers, iterators, config, computational_graph
+
 import matplotlib.pyplot as plt
 from mnist import MNIST
+import sys
 
 
 class GeneratorDistribution(object):
-
     def __init__(self, mean=0, sigma=0.5):
         self.mean = mean
         self.sigma = sigma
 
-    def sample(self,N=1):
-        data = np.random.randn(N)*self.sigma + self.mean
-        return np.array(data,dtype='float32')
+    def sample(self, N=1):
+        data = np.random.randn(N) * self.sigma + self.mean
+        return np.array(data, dtype='float32')
 
 
 class Generator(Chain):
-
-    def __init__(self, input_dims=100, feature_dims=100, conv_hidden1=28, conv_hidden2=28, hidden1=100, hidden2=49, batch_size=[1]):
+    def __init__(self, input_dims=100, feature_dims=100, conv_hidden1=28, conv_hidden2=28, hidden1=100, hidden2=49,
+                 batch_size=[1], nlayers=2):
 
         # inherit from Chain
         super(Generator, self).__init__()
 
+        assert 1 < nlayers < 6
+
         # define layers
         with self.init_scope():
             self.l1 = L.Linear(None, hidden1)
-            self.l2 = L.Linear(None, hidden2)
-            self.l3 = L.Convolution2D(None, 4,1)
-            self.l4 = L.Convolution2D(None, 8,1)
-            self.l5 = L.Convolution2D(None, 16,1)
+
+            # optional layers
+            if nlayers > 2:
+                self.l2 = L.Linear(None, hidden2)
+            if nlayers > 3:
+                self.l3 = L.Convolution2D(None, 4, 5)
+            if nlayers > 4:
+                self.l4 = L.Convolution2D(None, 8, 2)
+
+            # final layer
+            self.l5 = L.Convolution2D(None, feature_dims[1] * feature_dims[2], 2)
 
         # add variables to class
         self.feature_dims = feature_dims
         self.hidden_size = [hidden1, hidden2, conv_hidden1, conv_hidden2]
         self.output_size = feature_dims
         self.batch_size = batch_size
+        self.nlayers = nlayers
 
         self.reset()
 
@@ -50,36 +61,57 @@ class Generator(Chain):
             x = np.expand_dims(x, 0)  # add a fake dimension on x
 
         # propagate input through layers
-        h0 = F.leaky_relu(self.l1(x))
-        h1 = F.leaky_relu(self.l2(h0))
-        # data processing for convolution
-        h1.data = np.reshape(h1.data,[self.batch_size[0],7, 7])
-        h1.data = np.expand_dims(h1.data,axis=1).astype('float32')
-        h2 = F.leaky_relu(self.l3(h1))
-        h3 = F.leaky_relu(self.l4(h2))
-        h4 = F.leaky_relu(self.l5(h3))
+        h = F.leaky_relu(self.l1(x))
 
-        return h4
+        if self.nlayers > 2:
+            h = F.leaky_relu(self.l2(h))
+
+        # data processing for convolution
+        dim_size = int(np.sqrt(np.size(h) / self.batch_size))
+        h = F.reshape(h, [self.batch_size, dim_size, dim_size])  # reshape
+        h = F.expand_dims(h, axis=1)  # expand dims
+        h.data = h.data.astype('float32')
+
+        if self.nlayers > 3:
+            h = F.leaky_relu(self.l3(h))
+        if self.nlayers > 4:
+            h = F.leaky_relu(self.l4(h))
+
+        h = F.tanh(self.l5(h))
+
+        return h
 
     def reset(self):
         pass
 
 
 class Discriminator(Chain):
-
-    def __init__(self, feature_dims, conv_hidden1 = 28, conv_hidden2 = 50, conv_hidden3 = 100, hidden1=100, hidden2=50, hidden3=10, output=1, batch_size=1):
+    def __init__(self, feature_dims, conv_hidden1=28, conv_hidden2=50, conv_hidden3=100, hidden1=100, hidden2=50,
+                 hidden3=10, output=1, batch_size=1, nlayers=7):
 
         # inherit from Chain
         super(Discriminator, self).__init__()
 
+        assert 1 < nlayers < 8
+
         # define layers
         with self.init_scope():
-            self.l1 = L.Convolution2D(None, conv_hidden1, 1)
-            self.l2 = L.Convolution2D(None, conv_hidden2, 1)
-            self.l3 = L.Convolution2D(None, conv_hidden3, 1)
-            self.l4 = L.Linear(None, hidden1)
-            self.l5 = L.Linear(None, hidden2)
-            self.l6 = L.Linear(None, 10)
+
+            self.l1 = L.Convolution2D(None, conv_hidden1, 5)
+
+            # optional layers
+            if nlayers > 2:
+                self.l2 = L.Convolution2D(None, conv_hidden2, 5)
+            if nlayers > 3:
+                self.l3 = L.Convolution2D(None, conv_hidden3, 5)
+            if nlayers > 4:
+                self.l4 = L.Linear(None, hidden1)
+            if nlayers > 5:
+                self.l5 = L.Linear(None, hidden2)
+            if nlayers > 6:
+                self.l6 = L.Linear(None, hidden3)
+
+            # final layer
             self.l7 = L.Linear(None, output)
 
         # add variables to class
@@ -87,178 +119,180 @@ class Discriminator(Chain):
         self.hidden = [conv_hidden1, conv_hidden2, conv_hidden3, hidden1, hidden2, hidden3]
         self.output = output
         self.batch_size = batch_size
+        self.nlayers = nlayers
 
         self.reset()
 
-    def __call__(self,x):
+    def __call__(self, x):
 
         # change x type to Chainer variable
-        x = Variable(x)
+        if type(x) is not type(Variable()):
+            x = Variable(x)
 
         # process data
         try:
             x[0][0]
         except:
-            x = np.expand_dims(x, 0)  # add a fake dimension on x
+            x = np.expand_dims(x, 0)
 
-        # define number of channels for convolution
-        x.data = np.reshape(x.data, [self.batch_size, 28, 28])
-        x.data = np.expand_dims(x.data, axis=1).astype('float32')
+        # format for convolution
+        x = F.reshape(x, self.feature_dims)
+        x = F.expand_dims(x, axis=1)
+        x.data = x.data.astype("float32")
 
         # propagate input through layers
-        h0 = F.leaky_relu(self.l1(x))
-        h1 = F.leaky_relu(self.l2(h0))
-        h2 = F.leaky_relu(self.l3(h1))
-        h3 = F.leaky_relu(self.l4(h2))
-        h4 = F.leaky_relu(self.l5(h3))
-        h5 = F.tanh(self.l6(h4))
-        h6 = F.sigmoid(self.l7(h5))
+        h = F.leaky_relu(self.l1(x))
 
-        return h6
+        # optional layers
+        if self.nlayers > 2:
+            h = F.leaky_relu(self.l2(h))
+        if self.nlayers > 3:
+            h = F.leaky_relu(self.l3(h))
+        if self.nlayers > 4:
+            h = F.leaky_relu(self.l4(h))
+        if self.nlayers > 5:
+            h = F.leaky_relu(self.l5(h))
+        if self.nlayers > 6:
+            h = F.tanh(self.l6(h))
+
+        # final layer
+        h = F.sigmoid(self.l7(h))
+
+        return h
 
     def reset(self):
         pass
 
 
 def GAN(mndata=None, Generator=Generator, Discriminator=Discriminator, epochs=20, batch_size=200, feature_dims=1):
-
     # # init target distribution
     # distribution = GeneratorDistribution(mean=-3)
 
     if mndata:
-        feature_dims = [batch_size,28,28]
+        feature_dims = [batch_size, 28, 28]
     else:
         distribution = GeneratorDistribution(mean=-3)
 
     # calculate half batch
-    assert not(batch_size%2)
-    half_batch = feature_dims
-    half_batch[0] //= 2
+    # assert not(batch_size%2)
+    # half_batch = feature_dims
+    # half_batch[0] //= 2
 
     # init data iterators
-    train_iter = iterators.SerialIterator(mndata.train_images, half_batch[0])
-    test_iter = iterators.SerialIterator(mndata.test_images, half_batch[0],
+    train_iter = iterators.SerialIterator(mndata.train_images, feature_dims[0])
+    test_iter = iterators.SerialIterator(mndata.test_images, feature_dims[0],
                                          repeat=False, shuffle=True)
     # init networks
-    generator = Generator(feature_dims=feature_dims, input_dims=feature_dims, batch_size=half_batch)
-    discriminator = Discriminator(feature_dims=feature_dims, output=1, batch_size=batch_size)
+    generator = Generator(feature_dims=feature_dims, input_dims=feature_dims, batch_size=feature_dims[0], nlayers=5)
+    discriminator = Discriminator(feature_dims=feature_dims, output=1, batch_size=batch_size, nlayers=2)
 
     # init optimizers
     gen_optimizer = optimizers.adam.Adam()
-    disc_optimizer = optimizers.adam.Adam()
+    disc_optimizer = optimizers.SGD()
     gen_optimizer.setup(generator)
     disc_optimizer.setup(discriminator)
 
-    labels = np.zeros(batch_size)
-
     iter = 0
+    d_score = 0
+    g_score = 0
     # training loop
     while train_iter.epoch < epochs:
 
         iter += 1
+        data = train_iter.next()
+
         ## prepare data for discriminator
 
-
-        # get generator data
-        data1 = np.ndarray(half_batch)
-
-        gen_data = generator(np.random.random(size=feature_dims).astype('float32'))
-        data1 = gen_data.data
-        data1 = np.reshape(data1,(feature_dims))
-
-        if not(iter%6):
-            plt.imshow(data1[0],cmap='gray_r')
-
-        # if not i%100:
-        #     # visualize generator distribution
-        #     plt.clf()
-        #     plt.hist(data1, bins='auto', orientation='vertical')
-        #     plt.draw()
-
-        # label generator data as fake
-        label1 = np.zeros(half_batch[0])
-
         # get mnist data
-        data2 = train_iter.next()
-        data2 = np.array(data2)
-        data2 = np.reshape(data2,feature_dims)
+
+        data = np.array(np.divide(data, 255)-0.5)
+        data = np.reshape(data, feature_dims)
+        noise = (np.random.rand(feature_dims[0],feature_dims[1],feature_dims[2])-0.5)/5
+        noise = np.divide(noise, int(train_iter.epoch)+1)
+        data = data + noise
 
         # label mnist data as real
-        label2 = np.ones(half_batch[0])
-
-        # concatenate real and fake data into a single batch
-        data = np.concatenate((data1, data2), axis=0)
-        data = np.array(data).astype('float32')
-        labels = np.concatenate((label1, label2),axis=0).astype('int32')
+        labels = np.ones(feature_dims[0])
         labels = np.expand_dims(labels, axis=1)
 
         ### train discriminator
+        if iter == 1 or g_score > -1050: # iter % 4 == 1:
+            discriminator.cleargrads()
+            y = discriminator(data)  # discriminator response
+            d_loss_real = F.sigmoid_cross_entropy(y, labels.astype('int32'))  # calculate loss
+            #d_loss.backward()
+            #d_score = sum(y.data - (labels))
 
-        discriminator.cleargrads()
-        y = discriminator(data)  # discriminator response
-        d_loss = F.sigmoid_cross_entropy(y, labels)  # calculate loss
+            # update
+            #disc_optimizer.update()
 
-        # Calculate the gradients in the network
-
-        d_loss.backward()
-
-        # update
-        disc_optimizer.update()
-
-        # prepare for new data
-        data1 = np.ndarray(half_batch)
-        data2 = np.ndarray(half_batch)
-
-        # get fresh data from generator
-        gen_data1 = generator(np.random.random(size=feature_dims).astype('float32'))
-        gen_data2 = generator(np.random.random(size=feature_dims).astype('float32'))
-        data1 = gen_data1.data
-        data2 = gen_data2.data
-        data1 = np.reshape(data1, (feature_dims))
-        data2 = np.reshape(data2, (feature_dims))
-
-        # label both data batches as fake
-        label1 = np.zeros(half_batch[0])
-        label2 = np.zeros(half_batch[0])
-
-        # concatenate data into a single batch
-        data = np.concatenate((data1, data2), axis=0)
-        data = np.array(data).astype('float32')
-        labels = np.concatenate((label1, label2),axis=0).astype('int32') # complete batch is fake!
+        # label batch as fake
+        labels = np.ones(feature_dims[0]).astype('int32')
         labels = np.expand_dims(labels, axis=1)
 
         ### train generator
 
         generator.cleargrads()
-        y = discriminator(data)  # discriminator response after learning from batch
-        g_loss = F.sigmoid_cross_entropy(y, labels)
+        gen_samples = generator(np.random.random(size=feature_dims).astype('float32'))  # get fresh data from generator
+        gen_samples = F.reshape(gen_samples, feature_dims) + noise
+        y = discriminator(gen_samples)  # get discriminator response
+        g_loss = F.sigmoid_cross_entropy(y, labels)  # reward when discriminator is fooled
         g_loss.backward()
-        gen_optimizer.update()
 
-        # # if final loop
-        # if train_iter.is_new_epoch:
-        #     print('epoch: ',train_iter.epoch, ',generator loss: ',g_loss.data, 'discriminator loss: ', d_loss.data)
-        print('epoch: ', train_iter.epoch, ',generator loss: ', g_loss.data, 'discriminator loss: ', d_loss.data)
+
+        if iter == 1 or g_score > -1050: #iter % 4 is not(1): # maybe train discriminator
+            d_loss_fake = F.sigmoid_cross_entropy(y, labels - 1)
+            d_loss = d_loss_real + d_loss_fake
+            d_loss.backward()
+            disc_optimizer.update()
+            d_score = sum(y.data - (labels - 1))
+
+        g_score = sum(y.data - labels)
+        if iter == 1 or d_score < 1050:
+            gen_optimizer.update()
+        # disc_optimizer.update()
+
+        # store computational graph
+        if is_debug and iter == 1:
+            gen_comp_graph = computational_graph.build_computational_graph(y)
+            with open('/home/mknull/Desktop/dump.dot', 'w') as o:
+                o.write(gen_comp_graph.dump())
+
+        # print gradients
+        print('epoch:', train_iter.epoch, 'generator loss: ', g_loss.data, 'gen_score:', g_score,
+              'discriminator loss: ', d_loss.data, 'd_score', d_score, 'iter', iter)
+
+        if train_iter.is_new_epoch or not iter % 2000:
+            plt.ion()
+            data = gen_samples.data
+            image = np.reshape(data[0], [28, 28])
+            plt.imshow(image, cmap='gray_r')
+            plt.savefig('image_sample_epoch' + str(train_iter.epoch) + '.png')
+
     return generator, discriminator
 
-def visualize_generator_1D(generator_responses):
-    pass
 
-# data_range = GeneratorDistribution(mean=-3)
-# samples = data_range.sample(10000)
-# mygen=Generator(feature_dims=100,hidden_size=10,output=100)
-# mydisc=Discriminator(feature_dims=100,hidden0=10,hidden1=10,hidden2=10,output=1)
+def visualize_generator(generator, batch_size):
+    gen_data = generator(np.random.random(size=batch_size).astype('float32'))
+    data1 = gen_data.data
+    data1 = np.reshape(data1, batch_size)
+    plt.ion()
+    plt.imshow(data1[0], cmap='gray_r')
 
-# set interactive mode on
-plt.ion()
+is_debug = False  #gettrace = getattr(sys, 'gettrace', None)
 
-# get Mnist data
-mndata = MNIST('/home/mknull/python-mnist/data')
-mndata.load_training()
-mndata.load_testing()
+if is_debug:
+    config.debug = True
+    # set interactive mode on
+    plt.ion()
 
-batchsize=2000
+    # get Mnist data
+    mndata = MNIST('/home/mknull/python-mnist/data')
+    mndata.load_training()
+    mndata.load_testing()
 
-config.debug = True
-trained_generator, trained_discriminator = GAN(mndata=mndata, Generator=Generator, Discriminator=Discriminator, epochs=20, batch_size=batchsize)
-#plt.imshow(np.reshape(training_data[1],[28,28]),cmap='gray_r')
+    batchsize = 2000
+
+    # start training
+    trained_generator, trained_discriminator = GAN(mndata=mndata, Generator=Generator, Discriminator=Discriminator,
+                                                   epochs=300, batch_size=batchsize)
